@@ -236,36 +236,62 @@ async def get_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # === АНАЛИЗ ЕДЫ ЧЕРЕЗ GEMINI ===
-def analyze_food_with_ai(description=None, image=None):
-    prompt = """Ты — диетолог-эксперт. Проанализируй еду и оцени её КБЖУ.
+def analyze_food_with_ai(description=None, image=None, clarifications=None):
+    prompt = """Ты — профессиональный диетолог-эксперт с многолетним опытом. Твоя задача — максимально ТОЧНО оценить КБЖУ блюда. Точность важнее скорости.
 
-Если информации НЕ хватает для точной оценки (например непонятно жареная или варёная, какое масло, размер порции), задай уточняющий вопрос.
+🔍 ПРАВИЛО АНАЛИЗА:
+Прежде чем дать финальную оценку, ВНИМАТЕЛЬНО проверь — есть ли в блюде элементы, которые СУЩЕСТВЕННО влияют на калорийность, но непонятны без уточнения?
 
-Если информации достаточно — верни ТОЛЬКО JSON в формате:
-{
-  "status": "ok",
-  "dish": "название блюда",
-  "weight_g": 250,
-  "calories": 450,
-  "protein": 25,
-  "fat": 15,
-  "carbs": 50,
-  "comment": "краткий комментарий"
-}
+⚠️ ОБЯЗАТЕЛЬНО задавай вопросы если видишь:
+1. **Жареную еду** — спроси на каком масле жарили (растительное/сливочное/во фритюре) и сколько примерно
+2. **Соусы, заправки, подливы непонятного состава** — спроси что это за соус (томатный/сливочный/майонезный/острый и т.д.)
+3. **Овощи которые могут быть как сырыми, так и приготовленными** — спроси способ приготовления (варёные/тушёные/жареные/на пару)
+4. **Рис, паста, каша необычного цвета** — спроси готовилось ли с маслом, бульоном, томатом, сливками
+5. **Мясо/рыбу в панировке** — спроси из чего панировка и как жарилась
+6. **Гарниры с заправками** — уточни заправлены ли маслом, соусом
+7. **Размер порции** если непонятен — попроси указать примерный вес или сравнить с ладонью/кулаком
+8. **Напитки** — спроси добавлялся ли сахар, молоко, сливки
+
+❌ НЕ задавай вопросы про очевидное:
+- Про обычный хлеб, простые фрукты целиком, очевидно сырые овощи
+- Если пользователь уже сам всё подробно описал
+- Если уточнения уже были даны в предыдущих сообщениях
+
+📋 ФОРМАТ ОТВЕТА:
 
 Если нужно уточнение — верни ТОЛЬКО JSON:
 {
   "status": "need_info",
-  "question": "твой вопрос пользователю"
+  "question": "Сформулируй ВСЕ вопросы одним сообщением, понятным языком, перечисляя их через нумерацию или абзацы. Например:\n\n1. На каком масле жарилась рыба?\n2. Что за красный соус сверху?\n3. Заправлена ли фасоль маслом?"
 }
 
-Не добавляй текст вне JSON. Не используй markdown."""
+Если информации достаточно (или после получения уточнений) — верни ТОЛЬКО JSON:
+{
+  "status": "ok",
+  "dish": "Название блюда с ключевыми деталями приготовления",
+  "weight_g": 350,
+  "calories": 580,
+  "protein": 28,
+  "fat": 22,
+  "carbs": 60,
+  "comment": "Краткое объяснение из чего складывается калорийность (1-2 предложения)"
+}
+
+ВАЖНО:
+- Возвращай ТОЛЬКО JSON, без текста до или после
+- Не используй markdown-обёртки (```json и ```)
+- Будь точным в оценках — учитывай масло при жарке (+100-200 ккал на порцию), соусы (+50-150 ккал), сливки/майонез (+100+ ккал)"""
 
     try:
+        full_prompt = prompt
+        if clarifications:
+            full_prompt += f"\n\n📌 УТОЧНЕНИЯ ОТ ПОЛЬЗОВАТЕЛЯ:\n{clarifications}\n\nТеперь у тебя есть достаточно информации — дай финальную оценку КБЖУ."
+
         if image:
-            response = model.generate_content([prompt, image, description or "Что на фото?"])
+            user_msg = description if description else "Проанализируй еду на фото"
+            response = model.generate_content([full_prompt, image, user_msg])
         else:
-            response = model.generate_content(f"{prompt}\n\nОписание еды от пользователя: {description}")
+            response = model.generate_content(f"{full_prompt}\n\nОписание еды от пользователя: {description}")
 
         text = response.text.strip()
         # Убираем markdown если есть
@@ -298,6 +324,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
     result = analyze_food_with_ai(description=caption, image=image)
 
+    # Сохраняем фото в контекст на случай уточнений
+    if result.get('status') == 'need_info':
+        context.user_data['awaiting_clarification'] = True
+        context.user_data['original_description'] = caption
+        context.user_data['original_image'] = image
+        context.user_data['clarifications'] = ''
+
     await process_ai_result(update, context, result, user_result.data[0])
 
 # === ОБРАБОТКА ТЕКСТА ===
@@ -314,17 +347,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если ждём ответ на уточнение
     if context.user_data.get('awaiting_clarification'):
         original = context.user_data.get('original_description', '')
-        full_description = f"{original}. Дополнение: {text}"
-        context.user_data['awaiting_clarification'] = False
+        original_image = context.user_data.get('original_image', None)
+        previous_clarifications = context.user_data.get('clarifications', '')
+        new_clarifications = previous_clarifications + f"\n- {text}" if previous_clarifications else f"- {text}"
+
+        await update.message.reply_text("🔍 Учитываю уточнения...")
+        result = analyze_food_with_ai(
+            description=original,
+            image=original_image,
+            clarifications=new_clarifications
+        )
+
+        # Если ИИ задаёт ещё один вопрос — продолжаем диалог
+        if result.get('status') == 'need_info':
+            context.user_data['clarifications'] = new_clarifications
+        else:
+            # Если ответ финальный — очищаем контекст
+            context.user_data['awaiting_clarification'] = False
+            context.user_data['original_description'] = ''
+            context.user_data['original_image'] = None
+            context.user_data['clarifications'] = ''
     else:
-        full_description = text
+        # Новый запрос
+        await update.message.reply_text("🔍 Анализирую...")
+        result = analyze_food_with_ai(description=text)
 
-    await update.message.reply_text("🔍 Анализирую...")
-    result = analyze_food_with_ai(description=full_description)
-
-    if result.get('status') == 'need_info':
-        context.user_data['awaiting_clarification'] = True
-        context.user_data['original_description'] = full_description
+        if result.get('status') == 'need_info':
+            context.user_data['awaiting_clarification'] = True
+            context.user_data['original_description'] = text
+            context.user_data['original_image'] = None
+            context.user_data['clarifications'] = ''
 
     await process_ai_result(update, context, result, user_result.data[0])
 
