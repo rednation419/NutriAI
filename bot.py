@@ -6,10 +6,14 @@ from io import BytesIO
 from PIL import Image
 import pytz
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+    filters, ContextTypes, ConversationHandler, CallbackQueryHandler,
+    PreCheckoutQueryHandler
 )
 import google.generativeai as genai
 from supabase import create_client
@@ -43,6 +47,7 @@ BTN_WORKOUT = "🏃 Тренировка"
 BTN_HISTORY = "📈 История"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_HELP = "ℹ️ Помощь"
+BTN_DONATE = "⭐ Поблагодарить автора"
 BTN_RESET = "🔄 Сбросить профиль"
 BTN_BACK = "⬅️ В меню"
 
@@ -56,7 +61,7 @@ TIMEZONES = {
     "🇹🇭 Бангкок": "Asia/Bangkok", "🇯🇵 Токио": "Asia/Tokyo",
 }
 
-# === ТРЕНИРОВКИ (ккал/мин для веса 70кг, корректируется по весу) ===
+# === ТРЕНИРОВКИ — базовые ккал/мин при весе 70кг и средней сложности ===
 WORKOUT_TYPES = {
     "🚶 Ходьба": 4,
     "🏃 Бег": 11,
@@ -70,6 +75,21 @@ WORKOUT_TYPES = {
     "🤸 Танцы": 6,
 }
 
+# === СЛОЖНОСТЬ ТРЕНИРОВКИ ===
+WORKOUT_INTENSITY = {
+    "easy": {"label": "🟢 Лёгкая", "factor": 0.75, "desc": "разминка, спокойный темп, разговорный"},
+    "medium": {"label": "🟡 Средняя", "factor": 1.0, "desc": "обычная тренировка, есть пот"},
+    "hard": {"label": "🔴 Тяжёлая", "factor": 1.3, "desc": "до отказа, высокий пульс, тяжело говорить"},
+}
+
+# === ПАКЕТЫ ДОНАТОВ ===
+DONATE_TIERS = [
+    {"stars": 50, "label": "⭐ 50 Stars", "emoji": "☕", "msg": "За кофе автору"},
+    {"stars": 150, "label": "⭐⭐ 150 Stars", "emoji": "🍕", "msg": "На пиццу"},
+    {"stars": 500, "label": "⭐⭐⭐ 500 Stars", "emoji": "🎉", "msg": "Большая поддержка"},
+    {"stars": 1000, "label": "⭐⭐⭐⭐ 1000 Stars", "emoji": "💎", "msg": "Огромный респект"},
+]
+
 # === МЕНЮ ===
 def main_menu():
     keyboard = [
@@ -77,7 +97,8 @@ def main_menu():
         [BTN_FAVORITES, BTN_WORKOUT],
         [BTN_LABEL, BTN_MENU],
         [BTN_ASK, BTN_PROFILE],
-        [BTN_SETTINGS, BTN_HELP]
+        [BTN_SETTINGS, BTN_HELP],
+        [BTN_DONATE]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
@@ -374,7 +395,6 @@ async def handle_photo(update, context):
         context.user_data['photo_mode'] = 'food'
         return
 
-    # Обычный режим — еда
     await update.message.reply_text("🔍 Анализирую фото...")
     result = analyze_food_with_ai(description=caption, image=image)
     if result.get('status') == 'need_info':
@@ -388,23 +408,23 @@ async def handle_photo(update, context):
 async def handle_text(update, context):
     text = update.message.text
 
-    # Кнопки меню
     button_handlers = {
         BTN_STATS: stats, BTN_PROFILE: profile, BTN_HELP: help_cmd,
         BTN_SETTINGS: settings_view, BTN_ASK: ask_mode_on,
         BTN_FAVORITES: favorites_view, BTN_LABEL: label_mode_on,
         BTN_MENU: menu_mode_on, BTN_WORKOUT: workout_view,
         BTN_HISTORY: history_view, BTN_RESET: reset_confirm,
+        BTN_DONATE: donate_view,
     }
     if text in button_handlers:
         await button_handlers[text](update, context)
         return
 
-    # Спецкнопки
     if text == BTN_BACK:
         context.user_data['ask_mode'] = False
         context.user_data['photo_mode'] = 'food'
         context.user_data['awaiting_menu_text'] = False
+        context.user_data['adding_favorite'] = False
         await update.message.reply_text("Главное меню:", reply_markup=main_menu())
         return
     if text == "✅ Да, сбросить":
@@ -432,12 +452,10 @@ async def handle_text(update, context):
         await update.message.reply_text("Сначала /start", reply_markup=ReplyKeyboardRemove())
         return
 
-    # Режим добавления частого блюда
     if context.user_data.get('adding_favorite'):
         await add_favorite_process(update, context, user)
         return
 
-    # Режим генерации меню по тексту
     if context.user_data.get('awaiting_menu_text'):
         await update.message.reply_text("🍱 Генерирую меню...")
         result = generate_menu_from_text(text, user)
@@ -445,7 +463,6 @@ async def handle_text(update, context):
         context.user_data['awaiting_menu_text'] = False
         return
 
-    # Режим диетолога
     if context.user_data.get('ask_mode'):
         await update.message.reply_text("💭 Думаю...")
         answer = ask_dietitian_ai(text, user)
@@ -454,7 +471,6 @@ async def handle_text(update, context):
             reply_markup=back_menu())
         return
 
-    # Уточнение по блюду
     if context.user_data.get('awaiting_clarification'):
         original = context.user_data.get('original_description', '')
         original_image = context.user_data.get('original_image', None)
@@ -480,7 +496,7 @@ async def handle_text(update, context):
 
     await process_ai_result(update, context, result, user)
 
-# === ПРОЦЕСС РЕЗУЛЬТАТА ===
+# === РЕЗУЛЬТАТ АНАЛИЗА ===
 async def process_ai_result(update, context, result, user):
     if result.get('status') == 'error':
         await update.message.reply_text("❌ Ошибка. Попробуй ещё раз.", reply_markup=main_menu())
@@ -512,7 +528,6 @@ async def process_ai_result(update, context, result, user):
         bar = make_progress_bar(net_cal, cal_goal)
         burned_str = f"\n🏃 Сожжено тренировками: -{burned} ккал" if burned > 0 else ""
 
-        # Кнопка "Сохранить как частое"
         keyboard = [[InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]]
         await update.message.reply_text(
             f"✅ {result.get('dish', 'Блюдо')} (≈{result.get('weight_g', '?')}г)\n"
@@ -523,7 +538,6 @@ async def process_ai_result(update, context, result, user):
             f"🥩 Б: {total_p:.0f}/{user['protein_goal']} | 🧈 Ж: {total_f:.0f}/{user['fat_goal']} | 🍞 У: {total_c:.0f}/{user['carbs_goal']}",
             reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # Сохраняем последнее блюдо для возможности добавить в избранное
         context.user_data['last_meal'] = {
             'name': result.get('dish', 'Блюдо'),
             'description': result.get('dish', 'Блюдо'),
@@ -589,12 +603,9 @@ async def history_view(update, context):
         await update.message.reply_text("Сначала /start", reply_markup=ReplyKeyboardRemove())
         return
 
-    keyboard = [
-        [InlineKeyboardButton("📅 Неделя", callback_data="hist:7"),
-         InlineKeyboardButton("📆 Месяц", callback_data="hist:30")]
-    ]
-    await update.message.reply_text(
-        "📈 За какой период показать историю?",
+    keyboard = [[InlineKeyboardButton("📅 Неделя", callback_data="hist:7"),
+                 InlineKeyboardButton("📆 Месяц", callback_data="hist:30")]]
+    await update.message.reply_text("📈 За какой период?",
         reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def history_callback(update, context):
@@ -620,7 +631,6 @@ async def history_callback(update, context):
         await query.edit_message_text(f"📈 За последние {days} дней нет данных.")
         return
 
-    # Группируем по дням
     by_day = {}
     for m in meals:
         d = m['date']
@@ -636,7 +646,6 @@ async def history_callback(update, context):
             by_day[d] = {'cal': 0, 'p': 0, 'f': 0, 'c': 0, 'burned': 0}
         by_day[d]['burned'] += w['calories_burned']
 
-    # Средние
     days_count = len(by_day)
     avg_cal = sum(d['cal'] for d in by_day.values()) / days_count
     avg_p = sum(d['p'] for d in by_day.values()) / days_count
@@ -644,11 +653,9 @@ async def history_callback(update, context):
     avg_c = sum(d['c'] for d in by_day.values()) / days_count
     avg_burned = sum(d['burned'] for d in by_day.values()) / days_count
 
-    # Соответствие норме (±15%)
     in_norm = sum(1 for d in by_day.values() if abs(d['cal'] - user['calories_goal']) / user['calories_goal'] < 0.15)
     norm_pct = round(in_norm / days_count * 100)
 
-    # Топ-5 блюд
     dish_count = {}
     for m in meals:
         dish_count[m['description']] = dish_count.get(m['description'], 0) + 1
@@ -656,14 +663,12 @@ async def history_callback(update, context):
     top_str = "\n".join([f"• {d} ({c}р.)" for d, c in top_dishes])
 
     period = "недели" if days == 7 else "месяца"
-    text = (
-        f"📈 ИСТОРИЯ ЗА {days} дн.\n\n"
-        f"📊 Дней с записями: {days_count}/{days}\n"
-        f"🎯 В норме калорий: {in_norm} дней ({norm_pct}%)\n\n"
-        f"📐 СРЕДНИЕ ЗА ДЕНЬ:\n"
-        f"🔥 {avg_cal:.0f} ккал (норма {user['calories_goal']})\n"
-        f"🥩 Б: {avg_p:.0f} | 🧈 Ж: {avg_f:.0f} | 🍞 У: {avg_c:.0f}\n"
-    )
+    text = (f"📈 ИСТОРИЯ ЗА {days} дн.\n\n"
+            f"📊 Дней с записями: {days_count}/{days}\n"
+            f"🎯 В норме калорий: {in_norm} дней ({norm_pct}%)\n\n"
+            f"📐 СРЕДНИЕ ЗА ДЕНЬ:\n"
+            f"🔥 {avg_cal:.0f} ккал (норма {user['calories_goal']})\n"
+            f"🥩 Б: {avg_p:.0f} | 🧈 Ж: {avg_f:.0f} | 🍞 У: {avg_c:.0f}\n")
     if avg_burned > 10:
         text += f"🏃 Сожжено тренировками: {avg_burned:.0f} ккал/день\n"
     text += f"\n🏆 ТОП блюд {period}:\n{top_str}"
@@ -684,31 +689,29 @@ async def favorites_view(update, context):
         keyboard = [["➕ Добавить частое блюдо"], [BTN_BACK]]
         await update.message.reply_text(
             "🔁 ЧАСТЫЕ БЛЮДА\n\nЗдесь ещё пусто.\n\n"
-            "Сюда сохраняются твои регулярные блюда — например, завтрак-овсянка или обеденный салат. "
+            "Сюда сохраняются регулярные блюда — например, завтрак-овсянка или обеденный салат. "
             "Чтобы каждый раз не вводить заново.\n\n"
-            "💡 Совет: после добавления блюда обычным способом — нажми кнопку «⭐ Сохранить как частое».",
+            "💡 После обычного добавления блюда — нажми «⭐ Сохранить как частое».",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True))
         return
 
-    # Список с инлайн-кнопками
-    text = "🔁 ТВОИ ЧАСТЫЕ БЛЮДА:\n\nНажми на блюдо чтобы добавить его в дневник."
+    text = "🔁 ТВОИ ЧАСТЫЕ БЛЮДА:\n\nНажми чтобы добавить в дневник."
     keyboard = []
-    for f in favs[:20]:  # максимум 20
+    for f in favs[:20]:
         btn_text = f"+ {f['name']} ({f['calories']} ккал)"
         keyboard.append([InlineKeyboardButton(btn_text[:60], callback_data=f"addfav:{f['id']}")])
-        keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {f['name'][:30]}", callback_data=f"delfav:{f['id']}")])
+        keyboard.append([InlineKeyboardButton(f"🗑️ Удалить «{f['name'][:25]}»", callback_data=f"delfav:{f['id']}")])
 
-    bottom_keyboard = [["➕ Добавить частое блюдо"], [BTN_BACK]]
+    bottom = [["➕ Добавить частое блюдо"], [BTN_BACK]]
     await update.message.reply_text(text,
-        reply_markup=ReplyKeyboardMarkup(bottom_keyboard, resize_keyboard=True, is_persistent=True))
+        reply_markup=ReplyKeyboardMarkup(bottom, resize_keyboard=True, is_persistent=True))
     await update.message.reply_text("👇 Список:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def add_favorite_start(update, context):
     context.user_data['adding_favorite'] = True
     context.user_data['fav_step'] = 'name'
     await update.message.reply_text(
-        "➕ Добавление частого блюда\n\n"
-        "Шаг 1/2: Напиши название блюда (например: «Овсянка с бананом»)",
+        "➕ Добавление частого блюда\n\nШаг 1/2: Название (например: «Овсянка с бананом»)",
         reply_markup=ReplyKeyboardMarkup([[BTN_BACK]], resize_keyboard=True))
 
 async def add_favorite_process(update, context, user):
@@ -719,8 +722,7 @@ async def add_favorite_process(update, context, user):
         context.user_data['fav_name'] = text
         context.user_data['fav_step'] = 'description'
         await update.message.reply_text(
-            f"✓ Название: {text}\n\n"
-            f"Шаг 2/2: Опиши состав и порцию (например: «50г овсянки на воде, 1 банан, 1ч.л. мёда»)",
+            f"✓ Название: {text}\n\nШаг 2/2: Состав и порция (например: «50г овсянки на воде, 1 банан, 1ч.л. мёда»)",
             reply_markup=ReplyKeyboardMarkup([[BTN_BACK]], resize_keyboard=True))
         return
 
@@ -730,28 +732,23 @@ async def add_favorite_process(update, context, user):
 
         if result.get('status') != 'ok':
             await update.message.reply_text(
-                "❌ Не удалось распознать. Попробуй описать подробнее или нажми «⬅️ В меню».",
+                "❌ Не распознал. Опиши подробнее или нажми «⬅️ В меню».",
                 reply_markup=ReplyKeyboardMarkup([[BTN_BACK]], resize_keyboard=True))
             return
 
         user_id = str(update.effective_user.id)
         supabase.table("favorite_meals").insert({
-            "user_id": user_id,
-            "name": context.user_data['fav_name'],
-            "description": text,
-            "calories": result['calories'],
-            "protein": result['protein'],
-            "fat": result['fat'],
-            "carbs": result['carbs'],
-            "weight_g": result.get('weight_g', 0)
+            "user_id": user_id, "name": context.user_data['fav_name'],
+            "description": text, "calories": result['calories'],
+            "protein": result['protein'], "fat": result['fat'],
+            "carbs": result['carbs'], "weight_g": result.get('weight_g', 0)
         }).execute()
 
         context.user_data['adding_favorite'] = False
         context.user_data['fav_step'] = None
 
         await update.message.reply_text(
-            f"✅ Сохранено в избранное!\n\n"
-            f"⭐ {context.user_data['fav_name']}\n"
+            f"✅ Сохранено!\n\n⭐ {context.user_data['fav_name']}\n"
             f"🔥 {result['calories']} ккал | 🥩 {result['protein']}г | 🧈 {result['fat']}г | 🍞 {result['carbs']}г\n\n"
             f"Теперь добавишь в один тап через «{BTN_FAVORITES}».",
             reply_markup=main_menu())
@@ -777,16 +774,14 @@ async def add_fav_callback(update, context):
 
     supabase.table("meals").insert({
         "user_id": user_id, "date": today,
-        "description": fav['name'],
-        "calories": fav['calories'], "protein": fav['protein'],
-        "fat": fav['fat'], "carbs": fav['carbs']
+        "description": fav['name'], "calories": fav['calories'],
+        "protein": fav['protein'], "fat": fav['fat'], "carbs": fav['carbs']
     }).execute()
 
     meals = get_today_meals(user_id, today)
     total = sum(m['calories'] for m in meals)
     await query.message.reply_text(
-        f"✅ Добавил: {fav['name']} ({fav['calories']} ккал)\n\n"
-        f"📊 Сегодня: {total} / {user['calories_goal']} ккал",
+        f"✅ Добавил: {fav['name']} ({fav['calories']} ккал)\n\n📊 Сегодня: {total} / {user['calories_goal']} ккал",
         reply_markup=main_menu())
 
 async def del_fav_callback(update, context):
@@ -799,7 +794,6 @@ async def del_fav_callback(update, context):
 
 async def save_fav_callback(update, context):
     query = update.callback_query
-    await query.answer()
     user_id = str(query.from_user.id)
     last = context.user_data.get('last_meal')
     if not last:
@@ -807,11 +801,9 @@ async def save_fav_callback(update, context):
         return
 
     supabase.table("favorite_meals").insert({
-        "user_id": user_id,
-        "name": last['name'][:50],
-        "description": last.get('description', ''),
-        "calories": last['calories'], "protein": last['protein'],
-        "fat": last['fat'], "carbs": last['carbs'],
+        "user_id": user_id, "name": last['name'][:50],
+        "description": last.get('description', ''), "calories": last['calories'],
+        "protein": last['protein'], "fat": last['fat'], "carbs": last['carbs'],
         "weight_g": last.get('weight_g', 0)
     }).execute()
 
@@ -825,101 +817,56 @@ def analyze_label_with_ai(image, user):
 ПОЛЬЗОВАТЕЛЬ: {user['sex']}, {user['age']}л, цель {user['target_weight']}кг (текущий {user['weight']}кг), активность {user['activity']}
 НОРМА: {user['calories_goal']}ккал, Б{user['protein_goal']}/Ж{user['fat_goal']}/У{user['carbs_goal']}
 
-НАПИШИ ОТЧЁТ В ФОРМАТЕ:
+ФОРМАТ:
 
 🏷️ ПРОДУКТ
-[Название продукта если видно]
+[Название если видно]
 
-📊 СОСТАВ И КБЖУ (на 100г и на упаковку если видно)
-[Конкретные цифры]
+📊 СОСТАВ И КБЖУ (на 100г и упаковку)
+[Цифры]
 
 ⚠️ КРАСНЫЕ ФЛАГИ
-[Что плохого: трансжиры, добавленный сахар, искусственные подсластители, E-добавки, скрытые калории, плохие масла, избыток натрия]
+[Трансжиры, добавленный сахар, искусственные подсластители, E-добавки, скрытые калории, плохие масла, избыток натрия]
 
 ✅ ПЛЮСЫ
-[Что хорошего если есть]
+[Что хорошего]
 
 🎯 ВЕРДИКТ ДЛЯ ТЕБЯ
-[С учётом цели пользователя — стоит ли брать. Конкретно ДА/НЕТ/ОГРАНИЧЕННО и ПОЧЕМУ]
+[С учётом цели — стоит ли брать. ДА/НЕТ/ОГРАНИЧЕННО и ПОЧЕМУ]
 
 🔄 ЧЕМ ЗАМЕНИТЬ
-[2-3 конкретные альтернативы с указанием марок если уместно или категорий продуктов]
+[2-3 альтернативы]
 
-ВАЖНО: без markdown, живой язык, 200-350 слов. Если на фото НЕ этикетка — скажи что не видишь этикетки и попроси переснять."""
+ВАЖНО: без markdown, живой язык, 200-350 слов. Если на фото НЕ этикетка — попроси переснять."""
 
     try:
         return model.generate_content([prompt, image]).text.strip()
     except Exception as e:
         logger.error(f"Label error: {e}")
-        return "❌ Ошибка анализа этикетки. Попробуй ещё раз с более чётким фото."
+        return "❌ Ошибка анализа этикетки. Попробуй ещё раз с чётким фото."
 
 async def label_mode_on(update, context):
     context.user_data['photo_mode'] = 'label'
     await update.message.reply_text(
-        "🏷️ АНАЛИЗ ЭТИКЕТКИ\n\n"
-        "Сфотографируй этикетку продукта (состав, КБЖУ).\n\n"
-        "📸 Советы для хорошего фото:\n"
-        "• Хорошее освещение\n"
-        "• Текст в фокусе\n"
-        "• Видно состав И таблицу пищевой ценности\n\n"
-        "Я скажу стоит ли это брать тебе и чем можно заменить.",
+        "🏷️ АНАЛИЗ ЭТИКЕТКИ\n\nСфотографируй этикетку (состав, КБЖУ).\n\n"
+        "📸 Советы:\n• Хорошее освещение\n• Текст в фокусе\n• Видно состав И таблицу\n\n"
+        "Я скажу стоит ли это брать и чем заменить.",
         reply_markup=back_menu())
 
 # === ГЕНЕРАТОР МЕНЮ ===
 def generate_menu_from_fridge(image, user):
-    prompt = f"""Ты — диетолог. На фото — содержимое холодильника пользователя.
+    prompt = f"""Ты — диетолог. На фото — холодильник пользователя.
 
 ПОЛЬЗОВАТЕЛЬ: {user['name']}, {user['sex']}, {user['age']}л, цель {user['target_weight']}кг
 НОРМА: {user['calories_goal']}ккал, Б{user['protein_goal']}/Ж{user['fat_goal']}/У{user['carbs_goal']}
 
-ЗАДАЧА:
-1. Перечисли что видишь в холодильнике
-2. Составь МЕНЮ НА ДЕНЬ из этих продуктов (3 приёма + перекус)
-3. КБЖУ каждого приёма должно укладываться в норму
-
 ФОРМАТ:
 
 🛒 ВИЖУ В ХОЛОДИЛЬНИКЕ
-[список продуктов]
+[список]
 
-🍳 ЗАВТРАК (~25% дневной нормы)
-[блюдо + примерный КБЖУ + рецепт в 1-2 фразы]
-
-☀️ ОБЕД (~35%)
-[аналогично]
-
-🍎 ПЕРЕКУС (~10%)
-[аналогично]
-
-🌙 УЖИН (~30%)
-[аналогично]
-
-📊 ИТОГО ЗА ДЕНЬ
-🔥 ~ХХХХ ккал | 🥩 ХХг | 🧈 ХХг | 🍞 ХХг
-
-💡 ЧЕГО НЕ ХВАТАЕТ
-[Если в холодильнике дефицит каких-то нутриентов — что докупить]
-
-ВАЖНО: без markdown, живо, 250-400 слов. Если фото НЕ холодильник — скажи об этом."""
-
-    try:
-        return model.generate_content([prompt, image]).text.strip()
-    except Exception as e:
-        logger.error(f"Fridge error: {e}")
-        return "❌ Ошибка. Попробуй переснять."
-
-def generate_menu_from_text(text, user):
-    prompt = f"""Ты — диетолог. Составь персональное МЕНЮ НА ДЕНЬ для пользователя.
-
-ПОЛЬЗОВАТЕЛЬ: {user['name']}, {user['sex']}, {user['age']}л, цель {user['target_weight']}кг (текущий {user['weight']}кг)
-НОРМА: {user['calories_goal']}ккал, Б{user['protein_goal']}/Ж{user['fat_goal']}/У{user['carbs_goal']}
-
-ПОЖЕЛАНИЯ ПОЛЬЗОВАТЕЛЯ: {text}
-
-ФОРМАТ:
-
-🍳 ЗАВТРАК (~25% нормы)
-[блюдо + КБЖУ + быстрый рецепт]
+🍳 ЗАВТРАК (~25%)
+[блюдо + КБЖУ + рецепт 1-2 фразы]
 
 ☀️ ОБЕД (~35%)
 [аналогично]
@@ -931,15 +878,50 @@ def generate_menu_from_text(text, user):
 [аналогично]
 
 📊 ИТОГО
-🔥 ХХХХ ккал | 🥩 ХХг | 🧈 ХХг | 🍞 ХХг
+🔥 ~ХХХХ ккал | 🥩 ХХг | 🧈 ХХг | 🍞 ХХг
+
+💡 ЧЕГО НЕ ХВАТАЕТ
+[Дефицит нутриентов и что докупить]
+
+ВАЖНО: без markdown, 250-400 слов. Если не холодильник — попроси переснять."""
+
+    try:
+        return model.generate_content([prompt, image]).text.strip()
+    except Exception as e:
+        logger.error(f"Fridge error: {e}")
+        return "❌ Ошибка. Попробуй переснять."
+
+def generate_menu_from_text(text, user):
+    prompt = f"""Ты — диетолог. Составь МЕНЮ НА ДЕНЬ.
+
+ПОЛЬЗОВАТЕЛЬ: {user['name']}, {user['sex']}, {user['age']}л, цель {user['target_weight']}кг (текущий {user['weight']}кг)
+НОРМА: {user['calories_goal']}ккал, Б{user['protein_goal']}/Ж{user['fat_goal']}/У{user['carbs_goal']}
+
+ПОЖЕЛАНИЯ: {text}
+
+ФОРМАТ:
+
+🍳 ЗАВТРАК (~25%)
+[блюдо + КБЖУ + рецепт]
+
+☀️ ОБЕД (~35%)
+[аналогично]
+
+🍎 ПЕРЕКУС (~10%)
+[аналогично]
+
+🌙 УЖИН (~30%)
+[аналогично]
+
+📊 ИТОГО
+🔥 ХХХХ | 🥩 ХХ | 🧈 ХХ | 🍞 ХХ
 
 🛒 СПИСОК ПОКУПОК
-[Что нужно купить чтобы это приготовить]
 
-💡 СОВЕТ ОТ ДИЕТОЛОГА
-[1-2 предложения почему именно такое меню под цель пользователя]
+💡 СОВЕТ ДИЕТОЛОГА
+[1-2 предложения]
 
-ВАЖНО: без markdown, живо, 300-450 слов. Учитывай пожелания пользователя."""
+ВАЖНО: без markdown, 300-450 слов."""
 
     try:
         return model.generate_content(prompt).text.strip()
@@ -951,25 +933,17 @@ async def menu_mode_on(update, context):
     context.user_data['photo_mode'] = 'fridge'
     keyboard = [["🍳 Без продуктов — сгенерируй меню"], [BTN_BACK]]
     await update.message.reply_text(
-        "🍱 ГЕНЕРАТОР МЕНЮ\n\n"
-        "📸 Сфотографируй содержимое холодильника — я составлю меню из того что у тебя есть.\n\n"
-        "Или нажми кнопку ниже — придумаю меню без привязки к продуктам.",
+        "🍱 ГЕНЕРАТОР МЕНЮ\n\n📸 Сфотографируй холодильник — составлю меню из того что есть.\n\nИли нажми кнопку ниже — придумаю меню без продуктов.",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True))
 
 async def generate_menu_no_fridge(update, context):
     context.user_data['photo_mode'] = 'food'
     context.user_data['awaiting_menu_text'] = True
     await update.message.reply_text(
-        "✍️ Опиши свои пожелания к меню\n\n"
-        "Например:\n"
-        "• «Хочу что-то простое и быстрое»\n"
-        "• «Без мяса, побольше белка»\n"
-        "• «Бюджетные продукты»\n"
-        "• «Много овощей, я устал от мяса»\n"
-        "• Или просто напиши «без особых пожеланий»",
+        "✍️ Опиши пожелания\n\nНапример:\n• «Просто и быстро»\n• «Без мяса, побольше белка»\n• «Бюджетно»\n• «Много овощей»\n• Или «без особых пожеланий»",
         reply_markup=back_menu())
 
-# === ТРЕНИРОВКИ ===
+# === ТРЕНИРОВКИ — ВЫБОР ТИПА ===
 async def workout_view(update, context):
     user_id = str(update.effective_user.id)
     user = get_user(user_id)
@@ -979,14 +953,34 @@ async def workout_view(update, context):
 
     keyboard = [[InlineKeyboardButton(t, callback_data=f"wktype:{t}")] for t in WORKOUT_TYPES.keys()]
     await update.message.reply_text(
-        "🏃 ДОБАВИТЬ ТРЕНИРОВКУ\n\nВыбери тип:",
+        "🏃 ДОБАВИТЬ ТРЕНИРОВКУ\n\nШаг 1/3: Выбери тип:",
         reply_markup=InlineKeyboardMarkup(keyboard))
 
+# === ТРЕНИРОВКИ — ВЫБОР СЛОЖНОСТИ ===
 async def workout_type_callback(update, context):
     query = update.callback_query
     await query.answer()
     workout_type = query.data.split(":", 1)[1]
     context.user_data['workout_type'] = workout_type
+
+    keyboard = []
+    for code, info in WORKOUT_INTENSITY.items():
+        keyboard.append([InlineKeyboardButton(
+            f"{info['label']} — {info['desc']}",
+            callback_data=f"wkint:{code}")])
+
+    await query.edit_message_text(
+        f"🏃 {workout_type}\n\nШаг 2/3: Сложность тренировки?",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+# === ТРЕНИРОВКИ — ВЫБОР ДЛИТЕЛЬНОСТИ ===
+async def workout_intensity_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    intensity_code = query.data.split(":")[1]
+    context.user_data['workout_intensity'] = intensity_code
+    workout_type = context.user_data.get('workout_type', '')
+    intensity_label = WORKOUT_INTENSITY[intensity_code]['label']
 
     keyboard = [
         [InlineKeyboardButton("15 мин", callback_data="wkdur:15"),
@@ -997,14 +991,16 @@ async def workout_type_callback(update, context):
          InlineKeyboardButton("120 мин", callback_data="wkdur:120")]
     ]
     await query.edit_message_text(
-        f"🏃 {workout_type}\n\nСколько длилась тренировка?",
+        f"🏃 {workout_type}\n💪 Сложность: {intensity_label}\n\nШаг 3/3: Длительность?",
         reply_markup=InlineKeyboardMarkup(keyboard))
 
+# === ТРЕНИРОВКИ — СОХРАНЕНИЕ ===
 async def workout_duration_callback(update, context):
     query = update.callback_query
     await query.answer()
     duration = int(query.data.split(":")[1])
     workout_type = context.user_data.get('workout_type')
+    intensity_code = context.user_data.get('workout_intensity', 'medium')
 
     user_id = str(query.from_user.id)
     user = get_user(user_id)
@@ -1012,17 +1008,18 @@ async def workout_duration_callback(update, context):
         await query.edit_message_text("Ошибка. Попробуй ещё раз.")
         return
 
-    # Расчёт калорий по весу
+    intensity = WORKOUT_INTENSITY[intensity_code]
     weight_factor = user['weight'] / 70
-    calories_burned = round(WORKOUT_TYPES[workout_type] * duration * weight_factor)
+    base_kcal = WORKOUT_TYPES[workout_type] * duration * weight_factor
+    calories_burned = round(base_kcal * intensity['factor'])
 
     tz_str = user.get('timezone', 'Europe/Kyiv')
     today = get_user_today(tz_str)
 
     supabase.table("workouts").insert({
         "user_id": user_id, "date": today,
-        "type": workout_type, "duration_min": duration,
-        "calories_burned": calories_burned
+        "type": f"{workout_type} {intensity['label']}",
+        "duration_min": duration, "calories_burned": calories_burned
     }).execute()
 
     burned_today = daily_calories_burned(user_id, today)
@@ -1032,26 +1029,93 @@ async def workout_duration_callback(update, context):
 
     await query.edit_message_text(
         f"✅ Тренировка добавлена!\n\n"
-        f"🏃 {workout_type}\n"
-        f"⏱️ {duration} мин\n"
+        f"🏃 {workout_type}\n💪 {intensity['label']}\n⏱️ {duration} мин\n"
         f"🔥 Сожжено: ~{calories_burned} ккал\n\n"
-        f"📊 Сегодня:\n"
-        f"🍽️ Съедено: {eaten} ккал\n"
-        f"🏃 Сожжено: {burned_today} ккал\n"
-        f"⚡ Нетто: {net} / {user['calories_goal']} ккал")
+        f"📊 Сегодня:\n🍽️ Съедено: {eaten} ккал\n"
+        f"🏃 Сожжено: {burned_today} ккал\n⚡ Нетто: {net} / {user['calories_goal']} ккал")
 
-# === ДИЕТОЛОГ — режим вопросов ===
+# === ⭐ ДОНАТЫ TELEGRAM STARS ===
+async def donate_view(update, context):
+    keyboard = []
+    for tier in DONATE_TIERS:
+        keyboard.append([InlineKeyboardButton(
+            f"{tier['emoji']} {tier['label']} — {tier['msg']}",
+            callback_data=f"donate:{tier['stars']}")])
+
+    await update.message.reply_text(
+        "💛 ПОБЛАГОДАРИТЬ АВТОРА\n\n"
+        "Привет! 👋\n\n"
+        "Этот бот **полностью бесплатный** — без подписок, рекламы и платных функций. "
+        "В отличие от платных аналогов из AppStore (FatSecret, MyFitnessPal Premium, YAZIO Pro), "
+        "которые берут от $5 до $15 в месяц, NutriAI остаётся открытым для всех.\n\n"
+        "Если бот тебе помогает и ты хочешь поддержать развитие — можно поблагодарить автора через Telegram Stars ⭐\n\n"
+        "На что пойдут средства:\n"
+        "💰 Оплата серверов\n"
+        "🤖 API для ИИ-анализа\n"
+        "✨ Новые фишки (учёт воды, графики веса, рецепты)\n\n"
+        "Любая сумма — это огромная мотивация продолжать! Спасибо ❤️",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def donate_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    stars = int(query.data.split(":")[1])
+
+    tier = next((t for t in DONATE_TIERS if t['stars'] == stars), None)
+    if not tier:
+        return
+
+    prices = [LabeledPrice(label=f"Поддержка NutriAI", amount=stars)]
+
+    try:
+        await context.bot.send_invoice(
+            chat_id=query.from_user.id,
+            title=f"{tier['emoji']} {tier['msg']}",
+            description=f"Спасибо за поддержку NutriAI! Эта благодарность поможет развивать бот и держать его бесплатным.",
+            payload=f"donate_{stars}_{query.from_user.id}",
+            provider_token="",  # Для Stars пустая строка
+            currency="XTR",  # XTR = Telegram Stars
+            prices=prices
+        )
+    except Exception as e:
+        logger.error(f"Invoice error: {e}")
+        await query.message.reply_text("❌ Не удалось создать платёж. Попробуй позже.")
+
+async def precheckout_callback(update, context):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment_callback(update, context):
+    payment = update.message.successful_payment
+    stars = payment.total_amount
+
+    # Сохраним донат в базу
+    user_id = str(update.effective_user.id)
+    try:
+        supabase.table("donations").insert({
+            "user_id": user_id,
+            "stars": stars,
+            "payload": payment.invoice_payload
+        }).execute()
+    except Exception as e:
+        logger.error(f"Donation save error: {e}")
+
+    await update.message.reply_text(
+        f"💛 ОГРОМНОЕ СПАСИБО!\n\n"
+        f"⭐ {stars} Stars получены — это очень ценная поддержка!\n\n"
+        f"Благодаря тебе бот продолжит работать и развиваться. "
+        f"Если есть идеи новых фишек — всегда пиши через «{BTN_ASK}» или прямо в личку автору.\n\n"
+        f"Хорошего дня! 🌟",
+        reply_markup=main_menu())
+
+# === ДИЕТОЛОГ — режим ===
 async def ask_mode_on(update, context):
     context.user_data['ask_mode'] = True
     context.user_data['awaiting_clarification'] = False
     await update.message.reply_text(
-        "👨‍⚕️ ВОПРОС ДИЕТОЛОГУ\n\n"
-        "Задай любой вопрос о питании. Например:\n"
-        "• Что добавить для белка?\n"
-        "• Можно ли есть после 18:00?\n"
-        "• Какие перекусы полезные?\n"
-        "• Чем заменить сахар?\n\n"
-        "Напиши вопрос 👇",
+        "👨‍⚕️ ВОПРОС ДИЕТОЛОГУ\n\nЗадай любой вопрос. Например:\n"
+        "• Что добавить для белка?\n• Можно ли есть после 18:00?\n"
+        "• Полезные перекусы?\n• Чем заменить сахар?\n\nНапиши вопрос 👇",
         reply_markup=back_menu())
 
 # === ПРОФИЛЬ ===
@@ -1069,12 +1133,8 @@ async def profile(update, context):
         f"👤 ПРОФИЛЬ\n\n"
         f"🏷️ {user['name']}, {user['age']}л, {user['sex']}\n"
         f"📏 {user['height']}см, ⚖️ {user['weight']}кг → 🎯 {user['target_weight']}кг\n"
-        f"🏃 {user['activity']}\n"
-        f"🌍 {tz_d}\n"
-        f"🌙 Вечерний отчёт: {summary}\n\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📊 НОРМА:\n"
-        f"🔥 {user['calories_goal']} ккал\n"
+        f"🏃 {user['activity']}\n🌍 {tz_d}\n🌙 Вечерний отчёт: {summary}\n\n"
+        f"━━━━━━━━━━━━━━━\n📊 НОРМА:\n🔥 {user['calories_goal']} ккал\n"
         f"🥩 Б: {user['protein_goal']} | 🧈 Ж: {user['fat_goal']} | 🍞 У: {user['carbs_goal']}",
         reply_markup=main_menu())
 
@@ -1089,8 +1149,7 @@ async def settings_view(update, context):
     daily = user.get('daily_summary', True)
     status = "✅ ВКЛЮЧЁН" if daily else "❌ ВЫКЛЮЧЕН"
     await update.message.reply_text(
-        f"⚙️ НАСТРОЙКИ\n\n🌙 Вечерний отчёт: {status}\n\n"
-        f"Каждый день в 23:59 я могу присылать итог дня и рекомендации диетолога.",
+        f"⚙️ НАСТРОЙКИ\n\n🌙 Вечерний отчёт: {status}\n\nВ 23:59 я могу присылать итог дня и рекомендации.",
         reply_markup=settings_menu(daily))
 
 async def toggle_summary(update, context, enable):
@@ -1108,7 +1167,6 @@ async def toggle_summary(update, context, enable):
         msg = "🔔 Включён. Жди отчёт в 23:59."
     else:
         msg = "🔕 Выключен."
-
     await update.message.reply_text(msg, reply_markup=main_menu())
 
 # === СБРОС ===
@@ -1129,14 +1187,14 @@ async def reset_do(update, context):
     supabase.table("workouts").delete().eq("user_id", user_id).execute()
     supabase.table("favorite_meals").delete().eq("user_id", user_id).execute()
     await update.message.reply_text(
-        "🔄 Профиль удалён.\n\nНапиши /start чтобы создать заново.",
+        "🔄 Профиль удалён.\n\n/start чтобы создать заново.",
         reply_markup=ReplyKeyboardRemove())
 
 # === ПОМОЩЬ ===
 async def help_cmd(update, context):
     await update.message.reply_text(
         "ℹ️ КАК ПОЛЬЗОВАТЬСЯ\n\n"
-        "🍽️ Учёт еды:\n• Фото или текст — посчитаю КБЖУ\n• «⭐ Сохранить как частое» — добавит в избранное\n\n"
+        "🍽️ Учёт еды:\n• Фото или текст — посчитаю КБЖУ\n• «⭐ Сохранить как частое» добавит в избранное\n\n"
         f"📊 {BTN_STATS} — сегодня\n"
         f"📈 {BTN_HISTORY} — неделя/месяц\n"
         f"🔁 {BTN_FAVORITES} — частые блюда в один тап\n"
@@ -1144,7 +1202,8 @@ async def help_cmd(update, context):
         f"🏷️ {BTN_LABEL} — фото этикетки → стоит ли брать\n"
         f"🍱 {BTN_MENU} — меню по холодильнику или пожеланиям\n"
         f"💬 {BTN_ASK} — любой вопрос диетологу\n"
-        f"⚙️ {BTN_SETTINGS} — отчёт 23:59 / сброс\n\n"
+        f"⚙️ {BTN_SETTINGS} — отчёт 23:59 / сброс\n"
+        f"⭐ {BTN_DONATE} — поддержать автора\n\n"
         "💡 Совет: фоткай еду сверху для точной оценки.",
         reply_markup=main_menu())
 
@@ -1156,10 +1215,7 @@ def generate_daily_summary(user, meals, workouts):
         workouts_text = "🏃 ТРЕНИРОВКИ:\n" + "\n".join([f"- {w['type']} {w['duration_min']}мин: -{w['calories_burned']}ккал" for w in workouts]) + "\n\n"
 
     if not meals:
-        prompt = f"""Ты — диетолог. {user['name']} сегодня НЕ вносил еду.
-
-{workouts_text}
-Напиши тёплое напоминание (60-100 слов) о важности учёта. Без морализаторства, мотивирующе, без markdown."""
+        prompt = f"""Ты — диетолог. {user['name']} сегодня НЕ вносил еду.\n\n{workouts_text}\nНапиши тёплое напоминание (60-100 слов) о важности учёта. Без морализаторства, мотивирующе, без markdown."""
     else:
         meals_text = "\n".join([f"- {m['description']}: {m['calories']}ккал, Б{m['protein']}/Ж{m['fat']}/У{m['carbs']}" for m in meals])
         total_cal = sum(m['calories'] for m in meals)
@@ -1177,7 +1233,7 @@ def generate_daily_summary(user, meals, workouts):
 {meals_text}
 
 {workouts_text}ИТОГО:
-- Калории: {total_cal}/{user['calories_goal']} (нетто с учётом тренировок: {net})
+- Калории: {total_cal}/{user['calories_goal']} (нетто с тренировками: {net})
 - Б: {total_p:.0f}/{user['protein_goal']} | Ж: {total_f:.0f}/{user['fat_goal']} | У: {total_c:.0f}/{user['carbs_goal']}
 
 ФОРМАТ:
@@ -1189,13 +1245,13 @@ def generate_daily_summary(user, meals, workouts):
 [2-3 пункта]
 
 ⚠️ ЧТО УЛУЧШИТЬ
-[2-4 КОНКРЕТНЫХ профессиональных замечания: дефицит/избыток нутриентов, БЖУ, клетчатка, ГИ, быстрые углеводы вечером и т.д. С объяснением ПОЧЕМУ]
+[2-4 КОНКРЕТНЫХ замечания: дефицит/избыток, БЖУ, клетчатка, ГИ, быстрые углеводы вечером. С объяснением ПОЧЕМУ]
 
 💡 РЕКОМЕНДАЦИИ НА ЗАВТРА
-[3-4 конкретных совета с примерами продуктов и количеством]
+[3-4 совета с продуктами и количеством]
 
 🌟 ИНСАЙТ ДНЯ
-[Один яркий профессиональный факт связанный с тем что ел]
+[Профессиональный факт связанный с тем что ел]
 
 ВАЖНО: тёплый профессионал, конкретика, без воды, без markdown, 250-400 слов."""
 
@@ -1248,8 +1304,7 @@ def schedule_daily_summary(application, user):
         application.job_queue.run_daily(
             send_daily_summary,
             time=dtime(hour=23, minute=59, tzinfo=tz),
-            data={'user_id': user_id},
-            name=job_name)
+            data={'user_id': user_id}, name=job_name)
         logger.info(f"Scheduled for {user_id}")
     except Exception as e:
         logger.error(f"Schedule fail {user_id}: {e}")
@@ -1296,12 +1351,22 @@ def main():
     app.add_handler(CommandHandler("reset", reset_confirm))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_view))
+    app.add_handler(CommandHandler("donate", donate_view))
+
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist:"))
     app.add_handler(CallbackQueryHandler(add_fav_callback, pattern=r"^addfav:"))
     app.add_handler(CallbackQueryHandler(del_fav_callback, pattern=r"^delfav:"))
     app.add_handler(CallbackQueryHandler(save_fav_callback, pattern=r"^savefav:"))
     app.add_handler(CallbackQueryHandler(workout_type_callback, pattern=r"^wktype:"))
+    app.add_handler(CallbackQueryHandler(workout_intensity_callback, pattern=r"^wkint:"))
     app.add_handler(CallbackQueryHandler(workout_duration_callback, pattern=r"^wkdur:"))
+    app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
+
+    # Платежи
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
