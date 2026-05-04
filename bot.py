@@ -4,8 +4,9 @@ import json
 from datetime import date, datetime
 from io import BytesIO
 from PIL import Image
+import pytz
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
@@ -26,15 +27,60 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# === ИНИЦИАЛИЗАЦИЯ ИИ И БАЗЫ ===
+# === ИНИЦИАЛИЗАЦИЯ ===
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-flash-latest')
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # === СОСТОЯНИЯ РЕГИСТРАЦИИ ===
-NAME, AGE, SEX, HEIGHT, WEIGHT, TARGET_WEIGHT, ACTIVITY = range(7)
+NAME, AGE, SEX, HEIGHT, WEIGHT, TARGET_WEIGHT, ACTIVITY, TIMEZONE = range(8)
 
-# === РАСЧЁТ КАЛОРИЙ ПО ФОРМУЛЕ МИФФЛИНА-САН ЖЕОРА ===
+# === ТЕКСТЫ КНОПОК МЕНЮ ===
+BTN_STATS = "📊 Статистика"
+BTN_PROFILE = "👤 Мой профиль"
+BTN_RESET = "🔄 Сбросить профиль"
+BTN_HELP = "ℹ️ Помощь"
+
+# === ПОПУЛЯРНЫЕ ЧАСОВЫЕ ПОЯСА ===
+TIMEZONES = {
+    "🇺🇦 Киев": "Europe/Kyiv",
+    "🇷🇺 Москва": "Europe/Moscow",
+    "🇧🇾 Минск": "Europe/Minsk",
+    "🇰🇿 Алматы": "Asia/Almaty",
+    "🇺🇿 Ташкент": "Asia/Tashkent",
+    "🇩🇪 Берлин": "Europe/Berlin",
+    "🇬🇧 Лондон": "Europe/London",
+    "🇺🇸 Нью-Йорк": "America/New_York",
+    "🇺🇸 Лос-Анджелес": "America/Los_Angeles",
+    "🇦🇪 Дубай": "Asia/Dubai",
+    "🇹🇭 Бангкок": "Asia/Bangkok",
+    "🇯🇵 Токио": "Asia/Tokyo",
+}
+
+# === ГЛАВНОЕ МЕНЮ ===
+def main_menu():
+    keyboard = [
+        [BTN_STATS, BTN_PROFILE],
+        [BTN_RESET, BTN_HELP]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+# === ПОЛУЧИТЬ ТЕКУЩУЮ ДАТУ ПОЛЬЗОВАТЕЛЯ ===
+def get_user_today(timezone_str):
+    try:
+        tz = pytz.timezone(timezone_str)
+        return datetime.now(tz).date().isoformat()
+    except Exception:
+        return date.today().isoformat()
+
+def get_user_now(timezone_str):
+    try:
+        tz = pytz.timezone(timezone_str)
+        return datetime.now(tz)
+    except Exception:
+        return datetime.now()
+
+# === РАСЧЁТ КАЛОРИЙ ===
 def calculate_norms(sex, age, height, weight, activity, target_weight):
     if sex == "Мужской":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
@@ -64,6 +110,15 @@ def calculate_norms(sex, age, height, weight, activity, target_weight):
 
     return calories, protein, fat, carbs
 
+# === ПРОГРЕСС-БАР ===
+def make_progress_bar(current, goal, length=10):
+    if goal == 0:
+        return ""
+    percent = min(current / goal, 1.0)
+    filled = int(length * percent)
+    bar = "█" * filled + "░" * (length - filled)
+    return f"[{bar}] {int(percent * 100)}%"
+
 # === КОМАНДА /start ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -73,32 +128,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = result.data[0]
         await update.message.reply_text(
             f"👋 С возвращением, {user['name']}!\n\n"
-            f"📊 Твоя норма: {user['calories_goal']} ккал\n\n"
-            f"🍽️ Отправь фото или описание еды — я посчитаю калории.\n\n"
-            f"Команды:\n"
-            f"/stats — статистика за сегодня\n"
-            f"/reset — пересоздать профиль"
+            f"📊 Твоя норма: {user['calories_goal']} ккал в день\n\n"
+            f"🍽️ Просто отправь фото или описание еды — я посчитаю калории.\n\n"
+            f"Используй кнопки внизу для навигации 👇",
+            reply_markup=main_menu()
         )
         return ConversationHandler.END
 
     await update.message.reply_text(
         "👋 Привет! Я NutriAI — твой умный помощник по питанию.\n\n"
-        "Я помогу тебе считать калории и БЖУ, анализируя фото и описания твоей еды с помощью ИИ.\n\n"
+        "🤖 Я анализирую еду по фото или описанию с помощью ИИ и считаю калории, белки, жиры и углеводы.\n\n"
         "Сначала ответь на несколько вопросов, чтобы я рассчитал твою персональную норму.\n\n"
-        "Как тебя зовут?"
-    )
-    return NAME
-
-# === КОМАНДА /reset ===
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    supabase.table("users").delete().eq("user_id", user_id).execute()
-    supabase.table("meals").delete().eq("user_id", user_id).execute()
-    await update.message.reply_text(
-        "🔄 Профиль удалён. Напиши /start чтобы начать заново.",
+        "Как тебя зовут?",
         reply_markup=ReplyKeyboardRemove()
     )
-    return ConversationHandler.END
+    return NAME
 
 # === ШАГИ РЕГИСТРАЦИИ ===
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,6 +243,29 @@ async def get_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACTIVITY
 
     context.user_data['activity'] = update.message.text
+
+    # Спрашиваем часовой пояс
+    tz_buttons = list(TIMEZONES.keys())
+    keyboard = [tz_buttons[i:i+2] for i in range(0, len(tz_buttons), 2)]
+
+    await update.message.reply_text(
+        "🌍 Выбери свой часовой пояс — это нужно чтобы статистика правильно показывала «сегодня»:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return TIMEZONE
+
+async def get_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    selected = update.message.text
+    if selected not in TIMEZONES:
+        tz_buttons = list(TIMEZONES.keys())
+        keyboard = [tz_buttons[i:i+2] for i in range(0, len(tz_buttons), 2)]
+        await update.message.reply_text(
+            "Выбери из кнопок:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+        return TIMEZONE
+
+    context.user_data['timezone'] = TIMEZONES[selected]
     user_id = str(update.effective_user.id)
     d = context.user_data
 
@@ -219,7 +286,8 @@ async def get_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "calories_goal": calories,
         "protein_goal": protein,
         "fat_goal": fat,
-        "carbs_goal": carbs
+        "carbs_goal": carbs,
+        "timezone": d['timezone']
     }).execute()
 
     await update.message.reply_text(
@@ -230,8 +298,8 @@ async def get_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧈 Жиры: {fat} г\n"
         f"🍞 Углеводы: {carbs} г\n\n"
         f"🍽️ Теперь отправляй фото или описание еды — я посчитаю!\n\n"
-        f"Команды:\n/stats — статистика\n/reset — начать заново",
-        reply_markup=ReplyKeyboardRemove()
+        f"Используй кнопки внизу для навигации 👇",
+        reply_markup=main_menu()
     )
     return ConversationHandler.END
 
@@ -243,58 +311,51 @@ def analyze_food_with_ai(description=None, image=None, clarifications=None):
 Прежде чем дать финальную оценку, ВНИМАТЕЛЬНО проверь — есть ли в блюде элементы, которые СУЩЕСТВЕННО влияют на калорийность, но непонятны без уточнения?
 
 ⚠️ ОБЯЗАТЕЛЬНО задавай вопросы если видишь:
-1. **Жареную еду** — спроси на каком масле жарили (растительное/сливочное/во фритюре) и сколько примерно
-2. **Соусы, заправки, подливы непонятного состава** — спроси что это за соус (томатный/сливочный/майонезный/острый и т.д.)
-3. **Овощи которые могут быть как сырыми, так и приготовленными** — спроси способ приготовления (варёные/тушёные/жареные/на пару)
-4. **Рис, паста, каша необычного цвета** — спроси готовилось ли с маслом, бульоном, томатом, сливками
-5. **Мясо/рыбу в панировке** — спроси из чего панировка и как жарилась
-6. **Гарниры с заправками** — уточни заправлены ли маслом, соусом
-7. **Размер порции** если непонятен — попроси указать примерный вес или сравнить с ладонью/кулаком
-8. **Напитки** — спроси добавлялся ли сахар, молоко, сливки
+1. Жареную еду — спроси на каком масле жарили и сколько примерно
+2. Соусы, заправки, подливы непонятного состава
+3. Овощи которые могут быть как сырыми, так и приготовленными
+4. Рис, паста, каша необычного цвета
+5. Мясо/рыбу в панировке
+6. Гарниры с заправками
+7. Размер порции если непонятен
+8. Напитки — добавлялся ли сахар, молоко, сливки
 
-❌ НЕ задавай вопросы про очевидное:
-- Про обычный хлеб, простые фрукты целиком, очевидно сырые овощи
-- Если пользователь уже сам всё подробно описал
-- Если уточнения уже были даны в предыдущих сообщениях
+❌ НЕ задавай вопросы про очевидное.
 
 📋 ФОРМАТ ОТВЕТА:
 
 Если нужно уточнение — верни ТОЛЬКО JSON:
 {
   "status": "need_info",
-  "question": "Сформулируй ВСЕ вопросы одним сообщением, понятным языком, перечисляя их через нумерацию или абзацы. Например:\n\n1. На каком масле жарилась рыба?\n2. Что за красный соус сверху?\n3. Заправлена ли фасоль маслом?"
+  "question": "Все вопросы одним сообщением через нумерацию"
 }
 
-Если информации достаточно (или после получения уточнений) — верни ТОЛЬКО JSON:
+Если информации достаточно — верни ТОЛЬКО JSON:
 {
   "status": "ok",
-  "dish": "Название блюда с ключевыми деталями приготовления",
+  "dish": "Название блюда",
   "weight_g": 350,
   "calories": 580,
   "protein": 28,
   "fat": 22,
   "carbs": 60,
-  "comment": "Краткое объяснение из чего складывается калорийность (1-2 предложения)"
+  "comment": "Краткое объяснение (1-2 предложения)"
 }
 
-ВАЖНО:
-- Возвращай ТОЛЬКО JSON, без текста до или после
-- Не используй markdown-обёртки (```json и ```)
-- Будь точным в оценках — учитывай масло при жарке (+100-200 ккал на порцию), соусы (+50-150 ккал), сливки/майонез (+100+ ккал)"""
+ВАЖНО: только JSON, без markdown."""
 
     try:
         full_prompt = prompt
         if clarifications:
-            full_prompt += f"\n\n📌 УТОЧНЕНИЯ ОТ ПОЛЬЗОВАТЕЛЯ:\n{clarifications}\n\nТеперь у тебя есть достаточно информации — дай финальную оценку КБЖУ."
+            full_prompt += f"\n\n📌 УТОЧНЕНИЯ ОТ ПОЛЬЗОВАТЕЛЯ:\n{clarifications}\n\nТеперь дай финальную оценку КБЖУ."
 
         if image:
             user_msg = description if description else "Проанализируй еду на фото"
             response = model.generate_content([full_prompt, image, user_msg])
         else:
-            response = model.generate_content(f"{full_prompt}\n\nОписание еды от пользователя: {description}")
+            response = model.generate_content(f"{full_prompt}\n\nОписание еды: {description}")
 
         text = response.text.strip()
-        # Убираем markdown если есть
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -311,7 +372,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_result = supabase.table("users").select("*").eq("user_id", user_id).execute()
 
     if not user_result.data:
-        await update.message.reply_text("Сначала зарегистрируйся: /start")
+        await update.message.reply_text("Сначала зарегистрируйся: /start", reply_markup=ReplyKeyboardRemove())
         return
 
     await update.message.reply_text("🔍 Анализирую фото...")
@@ -324,7 +385,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
     result = analyze_food_with_ai(description=caption, image=image)
 
-    # Сохраняем фото в контекст на случай уточнений
     if result.get('status') == 'need_info':
         context.user_data['awaiting_clarification'] = True
         context.user_data['original_description'] = caption
@@ -335,16 +395,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОБРАБОТКА ТЕКСТА ===
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    # Обработка кнопок меню
+    if text == BTN_STATS:
+        await stats(update, context)
+        return
+    if text == BTN_PROFILE:
+        await profile(update, context)
+        return
+    if text == BTN_RESET:
+        await reset_confirm(update, context)
+        return
+    if text == BTN_HELP:
+        await help_cmd(update, context)
+        return
+    if text == "✅ Да, сбросить":
+        await reset_do(update, context)
+        return
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отмена.", reply_markup=main_menu())
+        return
+
     user_id = str(update.effective_user.id)
     user_result = supabase.table("users").select("*").eq("user_id", user_id).execute()
 
     if not user_result.data:
-        await update.message.reply_text("Сначала зарегистрируйся: /start")
+        await update.message.reply_text("Сначала зарегистрируйся: /start", reply_markup=ReplyKeyboardRemove())
         return
 
-    text = update.message.text
-
-    # Если ждём ответ на уточнение
+    # Если ждём уточнение
     if context.user_data.get('awaiting_clarification'):
         original = context.user_data.get('original_description', '')
         original_image = context.user_data.get('original_image', None)
@@ -358,17 +438,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clarifications=new_clarifications
         )
 
-        # Если ИИ задаёт ещё один вопрос — продолжаем диалог
         if result.get('status') == 'need_info':
             context.user_data['clarifications'] = new_clarifications
         else:
-            # Если ответ финальный — очищаем контекст
             context.user_data['awaiting_clarification'] = False
             context.user_data['original_description'] = ''
             context.user_data['original_image'] = None
             context.user_data['clarifications'] = ''
     else:
-        # Новый запрос
         await update.message.reply_text("🔍 Анализирую...")
         result = analyze_food_with_ai(description=text)
 
@@ -383,16 +460,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === ОБРАБОТКА РЕЗУЛЬТАТА ИИ ===
 async def process_ai_result(update, context, result, user):
     if result.get('status') == 'error':
-        await update.message.reply_text("❌ Ошибка анализа. Попробуй ещё раз.")
+        await update.message.reply_text("❌ Ошибка анализа. Попробуй ещё раз.", reply_markup=main_menu())
         return
 
     if result.get('status') == 'need_info':
-        await update.message.reply_text(f"❓ {result['question']}")
+        await update.message.reply_text(f"❓ {result['question']}", reply_markup=main_menu())
         return
 
     if result.get('status') == 'ok':
         user_id = str(update.effective_user.id)
-        today = date.today().isoformat()
+        timezone_str = user.get('timezone', 'Europe/Kyiv')
+        today = get_user_today(timezone_str)
 
         supabase.table("meals").insert({
             "user_id": user_id,
@@ -404,7 +482,6 @@ async def process_ai_result(update, context, result, user):
             "carbs": result.get('carbs', 0)
         }).execute()
 
-        # Считаем итоги дня
         meals_today = supabase.table("meals").select("*").eq("user_id", user_id).eq("date", today).execute()
         total_cal = sum(m['calories'] for m in meals_today.data)
         total_p = sum(m['protein'] for m in meals_today.data)
@@ -430,35 +507,41 @@ async def process_ai_result(update, context, result, user):
             f"🔥 Калории: {total_cal} / {user['calories_goal']} (осталось {cal_left})\n"
             f"🥩 Белки: {total_p:.0f} / {user['protein_goal']} (осталось {p_left:.0f})\n"
             f"🧈 Жиры: {total_f:.0f} / {user['fat_goal']} (осталось {f_left:.0f})\n"
-            f"🍞 Углеводы: {total_c:.0f} / {user['carbs_goal']} (осталось {c_left:.0f})"
+            f"🍞 Углеводы: {total_c:.0f} / {user['carbs_goal']} (осталось {c_left:.0f})",
+            reply_markup=main_menu()
         )
 
-# === ПРОГРЕСС-БАР ===
-def make_progress_bar(current, goal, length=10):
-    if goal == 0:
-        return ""
-    percent = min(current / goal, 1.0)
-    filled = int(length * percent)
-    bar = "█" * filled + "░" * (length - filled)
-    return f"[{bar}] {int(percent * 100)}%"
-
-# === КОМАНДА /stats ===
+# === КНОПКА: СТАТИСТИКА ===
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_result = supabase.table("users").select("*").eq("user_id", user_id).execute()
 
     if not user_result.data:
-        await update.message.reply_text("Сначала зарегистрируйся: /start")
+        await update.message.reply_text("Сначала зарегистрируйся: /start", reply_markup=ReplyKeyboardRemove())
         return
 
     user = user_result.data[0]
-    today = date.today().isoformat()
+    timezone_str = user.get('timezone', 'Europe/Kyiv')
+    today = get_user_today(timezone_str)
+    now = get_user_now(timezone_str)
+
+    # Красивая дата
+    months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+              'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+    weekdays = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
+    date_str = f"{now.day} {months[now.month - 1]} ({weekdays[now.weekday()]})"
+    time_str = now.strftime("%H:%M")
+
     meals = supabase.table("meals").select("*").eq("user_id", user_id).eq("date", today).execute()
 
     if not meals.data:
         await update.message.reply_text(
-            f"📊 Сегодня ты ещё ничего не ел.\n\n"
-            f"Твоя норма: {user['calories_goal']} ккал"
+            f"📊 СТАТИСТИКА\n"
+            f"📅 {date_str}\n"
+            f"🕐 {time_str}\n\n"
+            f"Сегодня ты ещё ничего не ел.\n\n"
+            f"🎯 Твоя норма: {user['calories_goal']} ккал",
+            reply_markup=main_menu()
         )
         return
 
@@ -468,17 +551,85 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_c = sum(m['carbs'] for m in meals.data)
 
     progress_bar = make_progress_bar(total_cal, user['calories_goal'])
-
     meals_list = "\n".join([f"• {m['description']} — {m['calories']} ккал" for m in meals.data])
 
     await update.message.reply_text(
-        f"📊 СТАТИСТИКА ЗА СЕГОДНЯ\n\n"
+        f"📊 СТАТИСТИКА\n"
+        f"📅 {date_str}\n"
+        f"🕐 {time_str}\n\n"
         f"{progress_bar}\n\n"
-        f"🔥 {total_cal} / {user['calories_goal']} ккал\n"
-        f"🥩 Б: {total_p:.0f} / {user['protein_goal']} г\n"
-        f"🧈 Ж: {total_f:.0f} / {user['fat_goal']} г\n"
-        f"🍞 У: {total_c:.0f} / {user['carbs_goal']} г\n\n"
-        f"🍽️ Приёмы пищи:\n{meals_list}"
+        f"🔥 Калории: {total_cal} / {user['calories_goal']} ккал\n"
+        f"🥩 Белки: {total_p:.0f} / {user['protein_goal']} г\n"
+        f"🧈 Жиры: {total_f:.0f} / {user['fat_goal']} г\n"
+        f"🍞 Углеводы: {total_c:.0f} / {user['carbs_goal']} г\n\n"
+        f"🍽️ Приёмы пищи ({len(meals.data)}):\n{meals_list}",
+        reply_markup=main_menu()
+    )
+
+# === КНОПКА: ПРОФИЛЬ ===
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    result = supabase.table("users").select("*").eq("user_id", user_id).execute()
+
+    if not result.data:
+        await update.message.reply_text("Сначала зарегистрируйся: /start", reply_markup=ReplyKeyboardRemove())
+        return
+
+    user = result.data[0]
+    tz_display = user.get('timezone', 'Europe/Kyiv').replace('_', ' ')
+
+    await update.message.reply_text(
+        f"👤 ТВОЙ ПРОФИЛЬ\n\n"
+        f"🏷️ Имя: {user['name']}\n"
+        f"🎂 Возраст: {user['age']} лет\n"
+        f"⚧ Пол: {user['sex']}\n"
+        f"📏 Рост: {user['height']} см\n"
+        f"⚖️ Текущий вес: {user['weight']} кг\n"
+        f"🎯 Желаемый вес: {user['target_weight']} кг\n"
+        f"🏃 Активность: {user['activity']}\n"
+        f"🌍 Часовой пояс: {tz_display}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 ДНЕВНАЯ НОРМА:\n"
+        f"🔥 Калории: {user['calories_goal']} ккал\n"
+        f"🥩 Белки: {user['protein_goal']} г\n"
+        f"🧈 Жиры: {user['fat_goal']} г\n"
+        f"🍞 Углеводы: {user['carbs_goal']} г",
+        reply_markup=main_menu()
+    )
+
+# === КНОПКА: СБРОС (подтверждение) ===
+async def reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["✅ Да, сбросить"], ["❌ Отмена"]]
+    await update.message.reply_text(
+        "⚠️ Ты уверен?\n\n"
+        "Все твои данные и история питания будут удалены. Это действие нельзя отменить.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+
+# === КНОПКА: СБРОС (выполнение) ===
+async def reset_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    supabase.table("users").delete().eq("user_id", user_id).execute()
+    supabase.table("meals").delete().eq("user_id", user_id).execute()
+    await update.message.reply_text(
+        "🔄 Профиль и история удалены.\n\nНапиши /start чтобы создать профиль заново.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+# === КНОПКА: ПОМОЩЬ ===
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ КАК ПОЛЬЗОВАТЬСЯ БОТОМ\n\n"
+        "🍽️ Чтобы добавить приём пищи:\n"
+        "• Отправь фото еды\n"
+        "• Или опиши словами что ты ел\n\n"
+        "🤖 ИИ проанализирует и посчитает КБЖУ. Если что-то непонятно — задаст уточняющие вопросы.\n\n"
+        "📊 Кнопки меню:\n"
+        f"• {BTN_STATS} — твоя статистика за сегодня\n"
+        f"• {BTN_PROFILE} — твои данные и нормы\n"
+        f"• {BTN_RESET} — удалить профиль и начать заново\n\n"
+        "💡 Совет: фотографируй еду сверху — так ИИ точнее оценит порцию.",
+        reply_markup=main_menu()
     )
 
 # === ОТМЕНА ===
@@ -500,13 +651,16 @@ def main():
             WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_weight)],
             TARGET_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_target_weight)],
             ACTIVITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_activity)],
+            TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_timezone)],
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("reset", reset_confirm))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
