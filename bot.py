@@ -405,11 +405,13 @@ async def handle_photo(update, context):
         return
 
     await update.message.reply_text("🔍 Анализирую фото...")
+    # Сохраняем оригинал для возможных исправлений
+    context.user_data['original_description'] = caption
+    context.user_data['original_image'] = image
+
     result = analyze_food_with_ai(description=caption, image=image)
     if result.get('status') == 'need_info':
         context.user_data['awaiting_clarification'] = True
-        context.user_data['original_description'] = caption
-        context.user_data['original_image'] = image
         context.user_data['clarifications'] = ''
     await process_ai_result(update, context, result, user)
 
@@ -435,6 +437,7 @@ async def handle_text(update, context):
         context.user_data['awaiting_menu_text'] = False
         context.user_data['adding_favorite'] = False
         context.user_data['editing_field'] = None
+        context.user_data['correcting_meal'] = False
         await update.message.reply_text("Главное меню:", reply_markup=main_menu())
         return
     if text == "✅ Да, сбросить":
@@ -462,7 +465,12 @@ async def handle_text(update, context):
         await update.message.reply_text("Сначала /start", reply_markup=ReplyKeyboardRemove())
         return
 
-    # === ОБРАБОТКА РЕДАКТИРОВАНИЯ ПОЛЯ ===
+    # === ИСПРАВЛЕНИЯ ЕДЫ ===
+    if context.user_data.get('correcting_meal'):
+        await correct_meal_process(update, context, user)
+        return
+
+    # === РЕДАКТИРОВАНИЕ ПОЛЯ ===
     if context.user_data.get('editing_field'):
         await edit_process(update, context, user)
         return
@@ -497,16 +505,15 @@ async def handle_text(update, context):
             context.user_data['clarifications'] = new_clar
         else:
             context.user_data['awaiting_clarification'] = False
-            context.user_data['original_description'] = ''
-            context.user_data['original_image'] = None
             context.user_data['clarifications'] = ''
     else:
         await update.message.reply_text("🔍 Анализирую...")
+        # Сохраняем для возможных исправлений
+        context.user_data['original_description'] = text
+        context.user_data['original_image'] = None
         result = analyze_food_with_ai(description=text)
         if result.get('status') == 'need_info':
             context.user_data['awaiting_clarification'] = True
-            context.user_data['original_description'] = text
-            context.user_data['original_image'] = None
             context.user_data['clarifications'] = ''
 
     await process_ai_result(update, context, result, user)
@@ -524,12 +531,15 @@ async def process_ai_result(update, context, result, user):
         tz_str = user.get('timezone', 'Europe/Kyiv')
         today = get_user_today(tz_str)
 
-        supabase.table("meals").insert({
+        # Вставляем запись и получаем ID
+        inserted = supabase.table("meals").insert({
             "user_id": user_id, "date": today,
             "description": result.get('dish', 'Блюдо'),
             "calories": result.get('calories', 0), "protein": result.get('protein', 0),
             "fat": result.get('fat', 0), "carbs": result.get('carbs', 0)
         }).execute()
+
+        meal_id = inserted.data[0]['id'] if inserted.data else None
 
         meals = get_today_meals(user_id, today)
         burned = daily_calories_burned(user_id, today)
@@ -543,7 +553,10 @@ async def process_ai_result(update, context, result, user):
         bar = make_progress_bar(net_cal, cal_goal)
         burned_str = f"\n🏃 Сожжено тренировками: -{burned} ккал" if burned > 0 else ""
 
-        keyboard = [[InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]]
+        keyboard = [
+            [InlineKeyboardButton("✏️ Внести исправления", callback_data="correct_meal")],
+            [InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]
+        ]
         await update.message.reply_text(
             f"✅ {result.get('dish', 'Блюдо')} (≈{result.get('weight_g', '?')}г)\n"
             f"🔥 {result['calories']} ккал | 🥩 {result['protein']}г | 🧈 {result['fat']}г | 🍞 {result['carbs']}г\n"
@@ -553,15 +566,136 @@ async def process_ai_result(update, context, result, user):
             f"🥩 Б: {total_p:.0f}/{user['protein_goal']} | 🧈 Ж: {total_f:.0f}/{user['fat_goal']} | 🍞 У: {total_c:.0f}/{user['carbs_goal']}",
             reply_markup=InlineKeyboardMarkup(keyboard))
 
+        # Сохраняем последнюю запись для исправлений и сохранения в избранное
         context.user_data['last_meal'] = {
+            'meal_id': meal_id,
             'name': result.get('dish', 'Блюдо'),
             'description': result.get('dish', 'Блюдо'),
             'calories': result.get('calories', 0),
             'protein': result.get('protein', 0),
             'fat': result.get('fat', 0),
             'carbs': result.get('carbs', 0),
-            'weight_g': result.get('weight_g', 0)
+            'weight_g': result.get('weight_g', 0),
+            'original_description': context.user_data.get('original_description', ''),
+            'original_image': context.user_data.get('original_image', None),
         }
+
+# === ✏️ ИСПРАВЛЕНИЯ К БЛЮДУ ===
+async def correct_meal_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    last = context.user_data.get('last_meal')
+    if not last or not last.get('meal_id'):
+        await query.answer("Запись не найдена — отправь блюдо заново", show_alert=True)
+        return
+
+    context.user_data['correcting_meal'] = True
+    await query.message.reply_text(
+        f"✏️ ВНЕСТИ ИСПРАВЛЕНИЯ\n\n"
+        f"Текущая запись:\n"
+        f"🍽️ {last['name']} (≈{last.get('weight_g', '?')}г)\n"
+        f"🔥 {last['calories']} ккал\n\n"
+        f"Опиши что не так. Например:\n"
+        f"• «Это был не майонез, а сметана»\n"
+        f"• «Порция была меньше, грамм 200»\n"
+        f"• «Жарилось не на масле, а на пару»\n"
+        f"• «Добавь, что был ещё кусок хлеба»\n\n"
+        f"Я пересчитаю КБЖУ с учётом твоих правок 👇",
+        reply_markup=back_menu())
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+async def correct_meal_process(update, context, user):
+    correction_text = update.message.text
+    last = context.user_data.get('last_meal')
+
+    if not last or not last.get('meal_id'):
+        context.user_data['correcting_meal'] = False
+        await update.message.reply_text("Запись не найдена.", reply_markup=main_menu())
+        return
+
+    await update.message.reply_text("🔍 Учитываю твои исправления и пересчитываю...")
+
+    correction_prompt = (
+        f"Предыдущая оценка блюда:\n"
+        f"- Название: {last['name']}\n"
+        f"- Вес: {last.get('weight_g', '?')}г\n"
+        f"- КБЖУ: {last['calories']}ккал, Б{last['protein']}/Ж{last['fat']}/У{last['carbs']}\n\n"
+        f"ПОЛЬЗОВАТЕЛЬ ВНЁС ИСПРАВЛЕНИЯ: {correction_text}\n\n"
+        f"Пересчитай КБЖУ с учётом этих исправлений и верни финальный JSON."
+    )
+
+    original_image = last.get('original_image')
+    original_desc = last.get('original_description') or last['name']
+
+    result = analyze_food_with_ai(
+        description=original_desc,
+        image=original_image,
+        clarifications=correction_prompt
+    )
+
+    if result.get('status') != 'ok':
+        await update.message.reply_text(
+            "❌ Не удалось пересчитать. Попробуй описать исправления ещё раз или отправь блюдо заново.",
+            reply_markup=main_menu())
+        context.user_data['correcting_meal'] = False
+        return
+
+    user_id = str(update.effective_user.id)
+    meal_id = last['meal_id']
+
+    # ОБНОВЛЯЕМ существующую запись
+    supabase.table("meals").update({
+        "description": result.get('dish', 'Блюдо'),
+        "calories": result.get('calories', 0),
+        "protein": result.get('protein', 0),
+        "fat": result.get('fat', 0),
+        "carbs": result.get('carbs', 0)
+    }).eq("id", meal_id).eq("user_id", user_id).execute()
+
+    tz_str = user.get('timezone', 'Europe/Kyiv')
+    today = get_user_today(tz_str)
+    meals = get_today_meals(user_id, today)
+    burned = daily_calories_burned(user_id, today)
+    total_cal = sum(m['calories'] for m in meals)
+    total_p = sum(m['protein'] for m in meals)
+    total_f = sum(m['fat'] for m in meals)
+    total_c = sum(m['carbs'] for m in meals)
+    net_cal = total_cal - burned
+    cal_goal = user['calories_goal']
+    bar = make_progress_bar(net_cal, cal_goal)
+    burned_str = f"\n🏃 Сожжено тренировками: -{burned} ккал" if burned > 0 else ""
+
+    diff_cal = result.get('calories', 0) - last['calories']
+    diff_str = f"({diff_cal:+d} ккал)" if diff_cal != 0 else "(без изменений)"
+
+    context.user_data['last_meal'].update({
+        'name': result.get('dish', 'Блюдо'),
+        'calories': result.get('calories', 0),
+        'protein': result.get('protein', 0),
+        'fat': result.get('fat', 0),
+        'carbs': result.get('carbs', 0),
+        'weight_g': result.get('weight_g', 0),
+    })
+
+    keyboard = [
+        [InlineKeyboardButton("✏️ Ещё исправление", callback_data="correct_meal")],
+        [InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]
+    ]
+
+    await update.message.reply_text(
+        f"✅ ОБНОВИЛ: {result.get('dish', 'Блюдо')} (≈{result.get('weight_g', '?')}г) {diff_str}\n"
+        f"🔥 {result['calories']} ккал | 🥩 {result['protein']}г | 🧈 {result['fat']}г | 🍞 {result['carbs']}г\n"
+        f"💬 {result.get('comment', '')}\n\n"
+        f"━━━━━━━━━━━━━━━\n📊 ЗА СЕГОДНЯ:\n{bar}\n\n"
+        f"🔥 {total_cal} / {cal_goal} ккал{burned_str}\n"
+        f"🥩 Б: {total_p:.0f}/{user['protein_goal']} | 🧈 Ж: {total_f:.0f}/{user['fat_goal']} | 🍞 У: {total_c:.0f}/{user['carbs_goal']}",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+    context.user_data['correcting_meal'] = False
 
 # === СТАТИСТИКА ===
 async def stats(update, context):
@@ -1181,7 +1315,6 @@ async def edit_callback(update, context):
     context.user_data['editing_field'] = field_key
 
     if field['type'] == 'choice':
-        # Выбор из списка
         opts = field['options']
         if field_key == 'edit_tz':
             kb = [opts[i:i+2] for i in range(0, len(opts), 2)]
@@ -1194,7 +1327,6 @@ async def edit_callback(update, context):
             f"{field['label']}\n\n{field['prompt']}",
             reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True))
     else:
-        # Ввод текста/числа
         await query.message.reply_text(
             f"{field['label']}\n\n{field['prompt']}",
             reply_markup=ReplyKeyboardMarkup([[BTN_BACK]], resize_keyboard=True))
@@ -1208,7 +1340,6 @@ async def edit_process(update, context, user):
     text = update.message.text
     user_id = str(update.effective_user.id)
 
-    # Парсим значение
     new_value = None
     db_field = None
 
@@ -1284,13 +1415,10 @@ async def edit_process(update, context, user):
         new_value = TIMEZONES[text]
         db_field = 'timezone'
 
-    # Сохраняем в базу
     update_data = {db_field: new_value}
 
-    # Если меняли вес/рост/возраст/пол/цель/активность — пересчитываем нормы
     recalc_fields = {'weight', 'height', 'age', 'sex', 'target_weight', 'activity'}
     if db_field in recalc_fields:
-        # Берём актуальные значения с учётом обновляемого
         current = {
             'weight': user['weight'], 'height': user['height'], 'age': user['age'],
             'sex': user['sex'], 'target_weight': user['target_weight'], 'activity': user['activity']
@@ -1306,7 +1434,6 @@ async def edit_process(update, context, user):
 
     supabase.table("users").update(update_data).eq("user_id", user_id).execute()
 
-    # Если меняли часовой пояс — пересоздаём задачу вечернего отчёта
     if db_field == 'timezone':
         updated_user = get_user(user_id)
         if updated_user and updated_user.get('daily_summary', True):
@@ -1314,7 +1441,6 @@ async def edit_process(update, context, user):
 
     context.user_data['editing_field'] = None
 
-    # Сообщение об успехе
     if 'calories_goal' in update_data:
         await update.message.reply_text(
             f"✅ {field['label']} обновлён!\n\n"
@@ -1353,7 +1479,9 @@ async def reset_do(update, context):
 async def help_cmd(update, context):
     await update.message.reply_text(
         "ℹ️ КАК ПОЛЬЗОВАТЬСЯ\n\n"
-        "🍽️ Учёт еды:\n• Фото или текст — посчитаю КБЖУ\n• «⭐ Сохранить как частое»\n\n"
+        "🍽️ Учёт еды:\n• Фото или текст — посчитаю КБЖУ\n"
+        "• «✏️ Внести исправления» — если ИИ что-то понял неверно\n"
+        "• «⭐ Сохранить как частое»\n\n"
         f"📊 {BTN_STATS} — сегодня\n"
         f"📈 {BTN_HISTORY} — неделя/месяц\n"
         f"🔁 {BTN_FAVORITES} — частые блюда в один тап\n"
@@ -1512,6 +1640,7 @@ def main():
     app.add_handler(CallbackQueryHandler(workout_duration_callback, pattern=r"^wkdur:"))
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
     app.add_handler(CallbackQueryHandler(edit_callback, pattern=r"^edit:"))
+    app.add_handler(CallbackQueryHandler(correct_meal_callback, pattern=r"^correct_meal$"))
 
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
