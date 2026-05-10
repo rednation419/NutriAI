@@ -555,7 +555,7 @@ async def process_ai_result(update, context, result, user):
 
         keyboard = [
             [InlineKeyboardButton("✏️ Внести исправления", callback_data="correct_meal")],
-            [InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]
+            [InlineKeyboardButton("⭐ Сохранить как частое", callback_data="savefav")]
         ]
         await update.message.reply_text(
             f"✅ {result.get('dish', 'Блюдо')} (≈{result.get('weight_g', '?')}г)\n"
@@ -683,7 +683,7 @@ async def correct_meal_process(update, context, user):
 
     keyboard = [
         [InlineKeyboardButton("✏️ Ещё исправление", callback_data="correct_meal")],
-        [InlineKeyboardButton("⭐ Сохранить как частое", callback_data=f"savefav:{result.get('dish', 'Блюдо')[:50]}")]
+        [InlineKeyboardButton("⭐ Сохранить как частое", callback_data="savefav")]
     ]
 
     await update.message.reply_text(
@@ -1634,7 +1634,7 @@ def main():
     app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist:"))
     app.add_handler(CallbackQueryHandler(add_fav_callback, pattern=r"^addfav:"))
     app.add_handler(CallbackQueryHandler(del_fav_callback, pattern=r"^delfav:"))
-    app.add_handler(CallbackQueryHandler(save_fav_callback, pattern=r"^savefav:"))
+    app.add_handler(CallbackQueryHandler(save_fav_callback, pattern=r"^savefav$"))
     app.add_handler(CallbackQueryHandler(workout_type_callback, pattern=r"^wktype:"))
     app.add_handler(CallbackQueryHandler(workout_intensity_callback, pattern=r"^wkint:"))
     app.add_handler(CallbackQueryHandler(workout_duration_callback, pattern=r"^wkdur:"))
